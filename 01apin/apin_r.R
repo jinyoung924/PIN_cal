@@ -20,8 +20,7 @@
 # ── 추정 전략 ────────────────────────────────────────────────────────────────
 #   ECM + Unrestricted (10개 파라미터) 단일 방법으로 통일.
 #   · 폴백(ML, Restricted) 없이 동일한 방법론으로 일관된 결과 생성
-#   · 넉넉한 타임아웃(기본 1200초=20분)으로 교착만 방지하고
-#     수렴에 충분한 시간을 부여하여 최적해 탐색
+#   · 타임아웃(기본 120초)으로 교착 및 비유동 종목 방지
 #   · 타임아웃 또는 수렴 실패 시 해당 윈도우를 스킵
 #
 # ── 적응형 초기화 전략 (Adaptive Initialization) ────────────────────────────
@@ -35,6 +34,19 @@
 #         + num_init = NUM_INIT_ROLL (기본 5) 개의 GE 랜덤 초기점 추가
 #     · 이후 윈도우 (직전 추정 실패):
 #         initialsets = "GE",   num_init = NUM_INIT_FIRST
+#
+# ── 병렬 전략: parLapplyLB (Load Balanced) ──────────────────────────────────
+#   기존 배치 방식(parLapply + 100종목 배치)은 배치 내 가장 느린 종목이
+#   끝날 때까지 전체 워커가 대기하는 동기 블로킹 문제가 있었음.
+#   → parLapplyLB로 전환: 워커가 종목 1개를 끝내면 즉시 다음 종목을 받아감.
+#   → 느린 종목이 있어도 나머지 워커는 계속 작업을 진행함.
+#   → 체크포인트는 종목 단위로 즉시 저장되어 중단 후 재개 가능.
+#
+# ── 진행 상황 모니터링 ──────────────────────────────────────────────────────
+#   R 콘솔에는 전체 완료 후에만 통계가 출력됨.
+#   실행 중 진행 상황은 별도 터미널에서 체크포인트 파일 수로 확인:
+#     PowerShell:  (Get-ChildItem checkpoints\sym_*.parquet).Count
+#   종목 1개가 끝날 때마다 파일이 1개씩 늘어남.
 #
 # ─── 입출력 ───────────────────────────────────────────────────────────────────
 # 입력  : R_output/{COUNTRY}/full_daily_bs.parquet  (01_preprocess.py 출력)
@@ -82,15 +94,12 @@ NUM_INIT_FIRST <- 20   # 첫 번째 윈도우 또는 직전 실패 시
 NUM_INIT_ROLL  <-  5   # 직전 성공 후 warm-start 사용 시
 
 # ── 병렬 설정 ────────────────────────────────────────────────────────────────
-NUM_WORKERS  <- parallel::detectCores(logical = TRUE)
-CHECKPOINT_N <- 100
+NUM_WORKERS <- parallel::detectCores(logical = TRUE)
 
 # ── 타임아웃 설정 ────────────────────────────────────────────────────────────
 # adjpin() 단일 호출의 시간 제한 (초)
-# 대부분의 윈도우는 수 초 ~ 수십 초에 완료됨.
-# 600초(10분)는 교착 상태만 방지하기 위한 안전장치이며,
-# 정상적인 수렴 과정에는 충분한 시간을 제공함.
-TIMEOUT_SEC <- 600
+# 정상 윈도우는 수 초 이내에 완료됨. 120초면 충분히 넉넉함.
+TIMEOUT_SEC <- 120
 
 
 # =============================================================================
@@ -111,8 +120,9 @@ cat(sprintf("  윈도우 크기 : %d영업일  |  최소 유효일: %d일\n", WI
 cat(sprintf("  Method      : %s Unrestricted  |  InitSets: %s\n", ADJPIN_METHOD, ADJPIN_INITSETS))
 cat(sprintf("  num_init    : 첫 윈도우 = %d  |  롤링 = %d (warm-start)\n",
             NUM_INIT_FIRST, NUM_INIT_ROLL))
-cat(sprintf("  CPU 코어    : %d개  |  로그 간격: %d종목\n", NUM_WORKERS, CHECKPOINT_N))
+cat(sprintf("  CPU 코어    : %d개\n", NUM_WORKERS))
 cat(sprintf("  타임아웃    : %d초 (%.0f분)\n", TIMEOUT_SEC, TIMEOUT_SEC / 60))
+cat(sprintf("  병렬 방식   : parLapplyLB (동적 할당, 배치 블로킹 없음)\n"))
 
 
 # =============================================================================
@@ -137,7 +147,7 @@ cat(sprintf("  날짜 범위   : %s ~ %s\n", min(daily_bs$Date), max(daily_bs$Da
 
 
 # =============================================================================
-# [2] 재개 확인
+# [2] 재개 확인 — 체크포인트 파일이 있는 종목은 자동 스킵
 # =============================================================================
 
 ckpt_files     <- list.files(CHECKPOINT_DIR, pattern = "^sym_.*\\.parquet$")
@@ -194,8 +204,6 @@ worker_process_symbol <- function(args) {
   }
 
   # ── adjpin() 단일 호출 + 타임아웃 래퍼 ────────────────────────────────────
-  # 성공: list(converged=TRUE, params_raw=..., a=..., APIN=..., ...)
-  # 실패: list(converged=FALSE)
   safe_adjpin <- function(window_df, cur_initialsets, cur_num_init) {
     tryCatch({
       withTimeout({
@@ -208,7 +216,6 @@ worker_process_symbol <- function(args) {
           verbose     = FALSE
         )
 
-        # adjpin이 내부적으로 실패하면 @adjpin 슬롯이 NaN이 될 수 있음
         apin_val <- as.numeric(res@adjpin)
         if (is.na(apin_val) || is.nan(apin_val)) {
           return(list(converged = FALSE))
@@ -238,7 +245,7 @@ worker_process_symbol <- function(args) {
   }
 
   # ── 상태 변수 ─────────────────────────────────────────────────────────────
-  prev_params   <- NULL           # 직전 윈도우 추정 파라미터 (warm-start 용)
+  prev_params   <- NULL
   results       <- list()
   count_success <- 0L
   count_skip    <- 0L
@@ -249,6 +256,7 @@ worker_process_symbol <- function(args) {
       window_B   <- sym_df$B[s:i]
       window_S   <- sym_df$S[s:i]
       valid_days <- sum((window_B + window_S) > 0)
+
       if (valid_days < min_valid_days) next
 
       window_df <- data.frame(B = window_B, S = window_S)
@@ -266,7 +274,6 @@ worker_process_symbol <- function(args) {
       est <- safe_adjpin(window_df, cur_initialsets, cur_num_init)
 
       if (!isTRUE(est$converged)) {
-        # 수렴 실패 또는 타임아웃 → 스킵, warm-start 초기화
         count_skip  <- count_skip + 1L
         prev_params <- NULL
         next
@@ -324,7 +331,7 @@ worker_process_symbol <- function(args) {
 
 
 # =============================================================================
-# [3-b] 종목 데이터 분할 + 병렬 처리
+# [3-b] 종목 데이터 분할 + 병렬 처리 (parLapplyLB — 동적 할당)
 # =============================================================================
 
 if (length(remaining_syms) > 0) {
@@ -352,72 +359,67 @@ if (length(remaining_syms) > 0) {
   cat("  분할 완료\n")
 
   # ==========================================================================
-  # [4] 병렬 처리
+  # [4] 병렬 처리 — parLapplyLB (Load Balanced, 동적 할당)
+  # ==========================================================================
+  #
+  # parLapplyLB는 워커가 작업을 끝내는 즉시 큐에서 다음 종목을 가져감.
+  # → 느린 종목(비유동주, 수렴 어려움)이 있어도 나머지 워커는 멈추지 않음.
+  # → 기존 배치 방식에서 1개 느린 종목이 99개 완료된 워커를 블로킹하던 문제 해소.
+  #
+  # 진행 상황 확인 (별도 터미널에서):
+  #   PowerShell: (Get-ChildItem checkpoints\sym_*.parquet).Count
   # ==========================================================================
 
   n_remaining <- length(remaining_syms)
   n_workers   <- min(NUM_WORKERS, n_remaining)
 
   cat(sprintf(paste0(
-    "\n[4] adjpin() 병렬 추정 — ECM Unrestricted\n",
+    "\n[4] adjpin() 병렬 추정 — ECM Unrestricted (parLapplyLB)\n",
     "    워커 %d개 | 윈도우 %d일 | 타임아웃 %d초(%.0f분)\n",
     "    수렴 실패 또는 타임아웃 → 스킵\n%s\n"),
     n_workers, WINDOW_SIZE, TIMEOUT_SEC, TIMEOUT_SEC / 60,
     strrep("-", 65)))
 
+  cat("    진행 상황 확인 (별도 터미널에서 체크포인트 파일 수 확인):\n")
+  cat(sprintf("      (Get-ChildItem '%s\\sym_*.parquet').Count\n\n",
+              gsub("/", "\\\\", CHECKPOINT_DIR)))
+
   start_time <- Sys.time()
   cl <- makeCluster(n_workers, type = "PSOCK")
   on.exit(tryCatch(stopCluster(cl), error = function(e) NULL), add = TRUE)
 
-  batch_starts <- seq(1, n_remaining, by = CHECKPOINT_N)
+  cat(sprintf("    %s  추정 시작 (%d종목) ...\n",
+              format(Sys.time(), "%H:%M:%S"), n_remaining))
 
-  # 전체 통계 누적
-  total_success <- 0L; total_skip <- 0L
-
-  for (bi in seq_along(batch_starts)) {
-    b_start <- batch_starts[bi]
-    b_end   <- min(b_start + CHECKPOINT_N - 1, n_remaining)
-
-    batch_result <- tryCatch(
-      parLapply(cl, symbol_args[b_start:b_end], worker_process_symbol),
-      error = function(e) {
-        cat(sprintf("  [Warning] 배치 %d 오류: %s\n", bi, e$message))
-        NULL
-      }
-    )
-
-    # ── 배치별 통계 집계 ─────────────────────────────────────────────────
-    if (!is.null(batch_result)) {
-      batch_ok   <- sum(vapply(batch_result, function(x) x$success, integer(1)))
-      batch_skip <- sum(vapply(batch_result, function(x) x$skipped, integer(1)))
-
-      total_success <- total_success + batch_ok
-      total_skip    <- total_skip    + batch_skip
-
-      if (batch_skip > 0) {
-        cat(sprintf("  [Skip] 이 배치: 성공=%d  스킵=%d\n", batch_ok, batch_skip))
-      }
+  all_results <- tryCatch(
+    parLapplyLB(cl, symbol_args, worker_process_symbol),
+    error = function(e) {
+      cat(sprintf("\n  [Error] 병렬 처리 오류: %s\n", e$message))
+      NULL
     }
+  )
 
-    n_done  <- length(completed_syms) + b_end
-    elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
-    eta_min <- if (b_end > 0) elapsed / b_end * (n_remaining - b_end) else NA
-    cat(sprintf("  [%s] %d / %d 종목 완료  (%.1f분 경과%s)\n",
-                format(Sys.time(), "%H:%M:%S"), n_done, n_total, elapsed,
-                if (!is.na(eta_min)) sprintf(" | 예상 잔여 %.0f분", eta_min) else ""))
-  }
+  elapsed_min <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
+  cat(sprintf("    %s  추정 완료 (%.1f분 소요)\n\n",
+              format(Sys.time(), "%H:%M:%S"), elapsed_min))
 
   # ── 전체 통계 요약 ──────────────────────────────────────────────────────
-  total_windows <- total_success + total_skip
-  cat(sprintf("\n  총 소요 시간: %.1f분\n",
-              as.numeric(difftime(Sys.time(), start_time, units = "mins"))))
-  cat(sprintf("\n  [추정 통계 — 전체 %s 윈도우]\n", format(total_windows, big.mark = ",")))
-  cat(sprintf("    성공 (ECM)  : %s (%.1f%%)\n",
-              format(total_success, big.mark = ","),
-              if (total_windows > 0) total_success / total_windows * 100 else 0))
-  cat(sprintf("    스킵        : %s (%.1f%%)\n",
-              format(total_skip, big.mark = ","),
-              if (total_windows > 0) total_skip / total_windows * 100 else 0))
+  if (!is.null(all_results)) {
+    total_success <- sum(vapply(all_results, function(x) x$success, integer(1)))
+    total_skip    <- sum(vapply(all_results, function(x) x$skipped, integer(1)))
+    total_windows <- total_success + total_skip
+
+    cat(sprintf("  [추정 통계 — 전체 %s 윈도우]\n",
+                format(total_windows, big.mark = ",")))
+    cat(sprintf("    성공 (ECM)      : %s (%.1f%%)\n",
+                format(total_success, big.mark = ","),
+                if (total_windows > 0) total_success / total_windows * 100 else 0))
+    cat(sprintf("    스킵            : %s (%.1f%%)\n",
+                format(total_skip, big.mark = ","),
+                if (total_windows > 0) total_skip / total_windows * 100 else 0))
+    cat(sprintf("    총 소요 시간    : %.1f분\n", elapsed_min))
+    cat(sprintf("    종목당 평균     : %.1f초\n", elapsed_min * 60 / n_remaining))
+  }
 }
 
 
