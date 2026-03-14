@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/c/Users/hisjk/Documents/PIN_cal/.venv/Scripts/python.exe --version 2>&1)",
+      "Bash(/c/Users/hisjk/Documents/PIN_cal/.venv/Scripts/pip.exe list:*)"
+    ]
+  }
+}
