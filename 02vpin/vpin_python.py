@@ -85,7 +85,7 @@ warnings.filterwarnings("ignore")
 
 BASE_DIR              = r"E:\vpin_project_parquet"
 YEAR_FOLDERS          = None        # None → KOR_* 폴더 전체 자동 탐색
-OUTPUT_DIR            = os.path.join(BASE_DIR, "output_data")
+OUTPUT_DIR            = os.path.join(BASE_DIR, "py_output")
 
 FORCE_REPROCESS_STEP1 = False       # True → 기존 1m_bars 파일 강제 재생성
 

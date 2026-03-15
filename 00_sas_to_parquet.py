@@ -16,6 +16,8 @@ SAS7BDAT → Parquet 배치 변환 스크립트
 - QSpread  : float64  — 호가 스프레드
 - LR       : int8     — 매수/매도 방향 (-1 or 1)
 
+Price    : float64 / Volume   : float64 /Symbol   : str/  Date :date32 / Time : time64 /LR :int8
+
 [핵심 타입 변환 로직]
 
   ① Date (SAS 날짜 → Polars `pl.Date` / Parquet `date32`)
