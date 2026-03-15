@@ -3,17 +3,15 @@
 # =============================================================================
 #
 # 실행 흐름:
-#   1. 00_setup.R       → 패키지 로드, 경로 설정, 코어 수 확인
-#   2. 01_data_prep.R   → 전처리 함수 정의
-#   3. 02_pin_worker.R  → PIN 워커 함수 정의
-#   4. 03_adjpin_worker.R → AdjPIN 워커 함수 정의
-#   5. 04_vpin_worker.R → VPIN 워커 함수 정의
-#   6. 나라별 순회:
-#      a) 원본 데이터 로드
-#      b) PIN 전처리 + 병렬 추정
-#      c) AdjPIN 전처리 + 병렬 추정
-#      d) VPIN 전처리 + 병렬 계산
-#   7. 완료 로그 기록
+#   1. 모듈 로드 (00_setup ~ 04_vpin_worker)
+#   2. 나라별 순회:
+#      a) stream_daily_bs()         → 파일별 스트리밍 B/S 집계 (OOM 방지)
+#      b) run_pin_all()             → PIN 추정 (체크포인트 + 병렬)
+#      c) run_adjpin_all()          → AdjPIN 추정 (체크포인트 + 병렬)
+#      d) rm(daily_bs); gc()        → PIN/AdjPIN 메모리 해제
+#      e) stream_vpin_ticks_to_disk() → 종목별 임시 parquet 생성
+#      f) run_vpin_all_streaming()  → VPIN 순차 계산 (종목별 파일 로드)
+#   3. 완료 로그
 #
 # 실행:
 #   Rscript R/main.R
@@ -31,29 +29,35 @@ cat(sprintf("%s\n\n", strrep("#", 65)))
 # =============================================================================
 
 # 스크립트 디렉토리 자동 감지
-script_dir <- tryCatch({
-  # Rscript로 실행 시
-  args <- commandArgs(trailingOnly = FALSE)
-  file_arg <- grep("^--file=", args, value = TRUE)
-  if (length(file_arg) > 0) {
-    dirname(normalizePath(sub("^--file=", "", file_arg)))
-  } else {
-    # RStudio 등에서 source() 시
-    getSrcDirectory(function(x) x)
+script_dir <- NULL
+
+# 방법 1: Rscript --file= 인자에서 추출
+args <- commandArgs(trailingOnly = FALSE)
+file_arg <- grep("^--file=", args, value = TRUE)
+if (length(file_arg) > 0) {
+  script_dir <- dirname(normalizePath(sub("^--file=", "", file_arg[1])))
+}
+
+# 방법 2: RStudio에서 source() 시
+if (is.null(script_dir)) {
+  src_dir <- tryCatch(getSrcDirectory(function(x) x), error = function(e) "")
+  if (length(src_dir) > 0 && nchar(src_dir) > 0) {
+    script_dir <- src_dir
   }
-}, error = function(e) {
-  "R"  # 기본값: 현재 디렉토리의 R/ 하위
-})
-
-# R/ 디렉토리가 아니면 R/ 하위로 이동
-if (!grepl("/R$", script_dir) && !grepl("\\\\R$", script_dir)) {
-  script_dir <- file.path(script_dir, "R")
 }
 
-# 디렉토리 존재 여부 확인, 없으면 현재 작업 디렉토리 사용
-if (!dir.exists(script_dir)) {
-  script_dir <- if (dir.exists("R")) "R" else "."
+# 방법 3: 현재 작업 디렉토리 기준 탐색
+if (is.null(script_dir)) {
+  if (dir.exists("R") && file.exists("R/00_setup.R")) {
+    script_dir <- "R"
+  } else if (file.exists("00_setup.R")) {
+    script_dir <- "."
+  } else {
+    script_dir <- "R"
+  }
 }
+
+cat(sprintf("[모듈 로드] 스크립트 디렉토리: %s\n", script_dir))
 
 source(file.path(script_dir, "00_setup.R"))
 source(file.path(script_dir, "01_data_prep.R"))
@@ -78,67 +82,58 @@ for (country in COUNTRIES) {
   log_msg(sprintf("=== %s 파이프라인 시작 ===", country), log_file)
 
 
-  # ── 2-a) 데이터 로드 ────────────────────────────────────────────────────
-  log_msg(sprintf("[%s] 원본 데이터 로드 중...", country), log_file)
+  # ── 2-a) PIN/AdjPIN용 스트리밍 집계 ────────────────────────────────────
+  # 파일 1개씩 읽고 → Date,Symbol,LR 3컬럼만 → 즉시 일별 B/S 집계 → raw 해제
+  # 메모리: 파일 1개 × 3컬럼 + 누적 집계 결과 (작음)
+  log_msg(sprintf("[%s] PIN/AdjPIN 데이터 스트리밍 집계 중...", country), log_file)
 
-  raw_data <- tryCatch(
-    load_raw_data(country, columns = c("Date", "Time", "Symbol", "Price", "Volume", "LR")),
+  daily_bs <- tryCatch(
+    stream_daily_bs(country, log_file),
     error = function(e) {
-      log_msg(sprintf("[ERROR] %s 데이터 로드 실패: %s", country, e$message), log_file)
+      log_msg(sprintf("[ERROR] %s 스트리밍 집계 실패: %s", country, e$message), log_file)
       NULL
     }
   )
-
-  if (is.null(raw_data)) {
-    log_msg(sprintf("[%s] 건너뜀 (데이터 로드 실패)", country), log_file)
-    next
-  }
 
 
   # ── 2-b) PIN 추정 ──────────────────────────────────────────────────────
-  log_msg(sprintf("[%s] PIN 추정 시작...", country), log_file)
-
-  daily_bs <- tryCatch(
-    prep_daily_bs(raw_data),
-    error = function(e) {
-      log_msg(sprintf("[ERROR] PIN 전처리 실패: %s", e$message), log_file)
-      NULL
-    }
-  )
-
   if (!is.null(daily_bs) && nrow(daily_bs) > 0) {
+    log_msg(sprintf("[%s] PIN 추정 시작...", country), log_file)
     run_pin_all(daily_bs, country, log_file)
   }
 
 
   # ── 2-c) AdjPIN 추정 ───────────────────────────────────────────────────
-  log_msg(sprintf("[%s] AdjPIN 추정 시작...", country), log_file)
-
-  # daily_bs는 PIN과 동일한 전처리 결과를 재사용
   if (!is.null(daily_bs) && nrow(daily_bs) > 0) {
+    log_msg(sprintf("[%s] AdjPIN 추정 시작...", country), log_file)
     run_adjpin_all(daily_bs, country, log_file)
   }
 
+  # PIN/AdjPIN 메모리 해제 — VPIN 전에 확보
+  rm(daily_bs); gc()
 
-  # ── 2-d) VPIN 계산 ─────────────────────────────────────────────────────
-  log_msg(sprintf("[%s] VPIN 계산 시작...", country), log_file)
 
-  vpin_ticks <- tryCatch(
-    prep_vpin_ticks(raw_data),
+  # ── 2-d) VPIN 스트리밍 ─────────────────────────────────────────────────
+  # 파일 1개씩 읽고 → 종목별로 분할 → 종목별 임시 parquet 저장
+  # 이후 종목별 파일을 하나씩 읽어 VPIN 계산
+  log_msg(sprintf("[%s] VPIN 틱 스트리밍 시작...", country), log_file)
+
+  vpin_tmp_dir <- file.path(OUTPUT_DIR, country, "vpin", "_tmp_ticks")
+
+  vpin_symbols <- tryCatch(
+    stream_vpin_ticks_to_disk(country, vpin_tmp_dir, log_file),
     error = function(e) {
-      log_msg(sprintf("[ERROR] VPIN 전처리 실패: %s", e$message), log_file)
-      NULL
+      log_msg(sprintf("[ERROR] %s VPIN 스트리밍 실패: %s", country, e$message), log_file)
+      character(0)
     }
   )
 
-  if (!is.null(vpin_ticks) && nrow(vpin_ticks) > 0) {
-    run_vpin_all(vpin_ticks, country, log_file)
+  if (length(vpin_symbols) > 0) {
+    log_msg(sprintf("[%s] VPIN 계산 시작 (%d종목)...", country, length(vpin_symbols)), log_file)
+    run_vpin_all_streaming(vpin_symbols, vpin_tmp_dir, country, log_file)
   }
 
-  # 메모리 해제
-  rm(raw_data, daily_bs, vpin_ticks)
   gc()
-
   log_msg(sprintf("=== %s 파이프라인 완료 ===", country), log_file)
 }
 

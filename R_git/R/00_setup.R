@@ -29,9 +29,20 @@ COUNTRIES <- c("KR")
 PROJECT_ROOT <- tryCatch(
   here::here(),
   error = function(e) {
-    # here 패키지 없으면 스크립트 위치 기준으로 추정
-    script_dir <- getSrcDirectory(function(x) x)
-    if (nchar(script_dir) > 0) dirname(script_dir) else getwd()
+    # here 패키지 없으면 여러 방법으로 추정
+    # 방법 1: Rscript --file= 인자
+    args <- commandArgs(trailingOnly = FALSE)
+    file_arg <- grep("^--file=", args, value = TRUE)
+    if (length(file_arg) > 0) {
+      return(dirname(dirname(normalizePath(sub("^--file=", "", file_arg[1])))))
+    }
+    # 방법 2: getSrcDirectory
+    src_dir <- tryCatch(getSrcDirectory(function(x) x), error = function(e2) "")
+    if (length(src_dir) > 0 && nchar(src_dir) > 0) {
+      return(dirname(src_dir))
+    }
+    # 방법 3: 현재 작업 디렉토리
+    getwd()
   }
 )
 

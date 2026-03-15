@@ -178,3 +178,103 @@ run_vpin_all <- function(vpin_ticks, country, log_file = NULL) {
   merge_checkpoints(checkpoint_dir, output_dir, country, "vpin",
                     ext = "csv", log_file = log_file)
 }
+
+
+#' 나라 전체 종목 VPIN 스트리밍 계산 (메모리 절약 모드)
+#'
+#' stream_vpin_ticks_to_disk()가 생성한 종목별 임시 파일을 하나씩 읽어 처리.
+#' 전체 틱 데이터를 메모리에 올리지 않음.
+#'
+#' @param all_symbols character vector: 처리할 종목 코드 목록
+#' @param vpin_tmp_dir 종목별 임시 파일 디렉토리
+#' @param country 나라 코드
+#' @param log_file 로그 파일 경로
+run_vpin_all_streaming <- function(all_symbols, vpin_tmp_dir, country, log_file = NULL) {
+  output_dir     <- get_output_dir(country, "vpin")
+  checkpoint_dir <- get_checkpoint_dir(country, "vpin")
+
+  # ── 체크포인트 확인 ──
+  completed <- get_completed_symbols(checkpoint_dir, ext = "csv")
+  remaining <- setdiff(all_symbols, completed)
+
+  log_msg(sprintf("[VPIN] %s: 전체 %d종목 | 완료 %d | 잔여 %d",
+                  country, length(all_symbols), length(completed), length(remaining)),
+          log_file)
+
+  if (length(remaining) == 0) {
+    log_msg("[VPIN] 모든 종목 처리 완료. 병합 단계로 이동.", log_file)
+  } else {
+    # ── 병렬 실행: 각 워커가 독립 파일을 읽으므로 충돌 없음 ──
+    future::plan(future::multisession, workers = N_CORES)
+    on.exit(future::plan(future::sequential), add = TRUE)
+
+    BATCH_SIZE <- 100L
+    batch_starts <- seq(1L, length(remaining), by = BATCH_SIZE)
+    start_time <- Sys.time()
+
+    for (bi in seq_along(batch_starts)) {
+      b_start <- batch_starts[bi]
+      b_end   <- min(b_start + BATCH_SIZE - 1L, length(remaining))
+      batch_syms <- remaining[b_start:b_end]
+
+      batch_results <- furrr::future_map(batch_syms, function(sym) {
+        suppressPackageStartupMessages({
+          library(dplyr); library(zoo); library(readr); library(arrow)
+        })
+
+        # 각 워커가 자신의 종목 파일을 디스크에서 독립적으로 읽음
+        sym_data <- load_vpin_sym(sym, vpin_tmp_dir)
+
+        if (is.null(sym_data) || nrow(sym_data) == 0) {
+          empty <- data.frame(
+            symbol = character(0), bucket = integer(0),
+            bucket_date = as.Date(character(0)),
+            buy_vol = numeric(0), sell_vol = numeric(0),
+            oi = numeric(0), vpin = numeric(0), vbs = numeric(0),
+            created_at = character(0), stringsAsFactors = FALSE
+          )
+          save_checkpoint(empty, sym, checkpoint_dir)
+          return(list(symbol = sym, n_rows = 0L))
+        }
+
+        result <- tryCatch(
+          run_vpin_worker(sym_data, sym, checkpoint_dir),
+          error = function(e) {
+            empty <- data.frame(
+              symbol = character(0), bucket = integer(0),
+              bucket_date = as.Date(character(0)),
+              buy_vol = numeric(0), sell_vol = numeric(0),
+              oi = numeric(0), vpin = numeric(0), vbs = numeric(0),
+              created_at = character(0), stringsAsFactors = FALSE
+            )
+            save_checkpoint(empty, sym, checkpoint_dir)
+            list(symbol = sym, n_rows = 0L, error = e$message)
+          }
+        )
+
+        rm(sym_data); gc()
+        result
+      }, .options = furrr::furrr_options(seed = TRUE))
+
+      # 진행상황
+      n_done  <- length(completed) + b_end
+      elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
+      speed   <- b_end / max(elapsed, 0.01)
+      eta_min <- (length(remaining) - b_end) / max(speed, 0.01)
+      n_ok    <- sum(vapply(batch_results, function(r) r$n_rows > 0, logical(1)))
+
+      log_msg(sprintf(
+        "  [VPIN] 배치 %d/%d | 누적 %d/%d종목 | 성공 %d/%d | %.1f분 경과 | ETA %.0f분",
+        bi, length(batch_starts), n_done, length(all_symbols),
+        n_ok, length(batch_syms), elapsed, eta_min
+      ), log_file)
+    }
+
+    total_min <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
+    log_msg(sprintf("[VPIN] %s 계산 완료: %.1f분 소요", country, total_min), log_file)
+  }
+
+  # ── 최종 병합 ──
+  merge_checkpoints(checkpoint_dir, output_dir, country, "vpin",
+                    ext = "csv", log_file = log_file)
+}
