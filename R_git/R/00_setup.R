@@ -58,7 +58,12 @@ VPIN_SAMPLENGTH <- 50         # VPIN 롤링 윈도우 버킷 수
 # ★ 병렬 설정
 # =============================================================================
 
-N_CORES <- max(1L, parallel::detectCores(logical = TRUE) - 1L)
+# logical=FALSE로 물리 코어만 세고, 절반만 사용하여 워커 오버헤드를 줄인다.
+N_CORES <- max(1L, parallel::detectCores(logical = FALSE) %/% 2L)
+
+# PINstimation .onLoad()가 future.globals.maxSize = +Inf로 설정하므로 되돌린다.
+# 워커 1개에 전달되는 데이터가 1GB를 넘으면 경고가 나도록 설정.
+options(future.globals.maxSize = 1 * 1024^3)  # 1GB
 
 
 # =============================================================================

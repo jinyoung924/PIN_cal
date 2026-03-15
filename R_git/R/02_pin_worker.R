@@ -133,11 +133,17 @@ run_pin_all <- function(daily_bs, country, log_file = NULL) {
       b_end   <- min(b_start + BATCH_SIZE - 1L, length(remaining))
       batch_syms <- remaining[b_start:b_end]
 
+      # 배치 종목별로 미리 split — 워커에는 자기 종목 데이터만 전달됨
+      split_data <- lapply(
+        setNames(batch_syms, batch_syms),
+        function(s) daily_bs[daily_bs$Symbol == s, ]
+      )
+
       batch_results <- furrr::future_map(batch_syms, function(sym) {
         suppressPackageStartupMessages({
           library(PINstimation); library(dplyr); library(readr); library(arrow)
         })
-        sym_data <- daily_bs[daily_bs$Symbol == sym, ]
+        sym_data <- split_data[[sym]]
         tryCatch(
           run_pin_worker(sym_data, sym, checkpoint_dir, log_file),
           error = function(e) {
@@ -153,6 +159,8 @@ run_pin_all <- function(daily_bs, country, log_file = NULL) {
         )
       }, .options = furrr::furrr_options(seed = TRUE))
 
+      rm(split_data)  # 배치 끝나면 즉시 해제
+
       # 진행상황 출력
       n_done   <- length(completed) + b_end
       elapsed  <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
@@ -165,6 +173,7 @@ run_pin_all <- function(daily_bs, country, log_file = NULL) {
         bi, length(batch_starts), n_done, length(all_symbols),
         n_ok, length(batch_syms), elapsed, eta_min
       ), log_file)
+      gc()  # 배치별 중간 메모리 회수
     }
 
     total_min <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))

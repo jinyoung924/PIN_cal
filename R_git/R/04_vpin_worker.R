@@ -197,6 +197,7 @@ run_vpin_all_arrow <- function(all_symbols, country, log_file = NULL) {
         bi, length(batch_starts), n_done, length(all_symbols),
         n_ok, length(batch_syms), elapsed, eta_min
       ), log_file)
+      gc()  # 배치별 중간 메모리 회수
     }
 
     total_min <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
