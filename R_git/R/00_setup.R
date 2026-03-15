@@ -23,28 +23,11 @@ suppressPackageStartupMessages({
 # =============================================================================
 
 # 처리할 나라 목록
-COUNTRIES <- c("KR")
+COUNTRIES <- c("KOR")
 
 # 프로젝트 루트 (이 파일 기준 자동 감지 또는 수동 설정)
-PROJECT_ROOT <- tryCatch(
-  here::here(),
-  error = function(e) {
-    # here 패키지 없으면 여러 방법으로 추정
-    # 방법 1: Rscript --file= 인자
-    args <- commandArgs(trailingOnly = FALSE)
-    file_arg <- grep("^--file=", args, value = TRUE)
-    if (length(file_arg) > 0) {
-      return(dirname(dirname(normalizePath(sub("^--file=", "", file_arg[1])))))
-    }
-    # 방법 2: getSrcDirectory
-    src_dir <- tryCatch(getSrcDirectory(function(x) x), error = function(e2) "")
-    if (length(src_dir) > 0 && nchar(src_dir) > 0) {
-      return(dirname(src_dir))
-    }
-    # 방법 3: 현재 작업 디렉토리
-    getwd()
-  }
-)
+PROJECT_ROOT <- "C:/Users/hisjk/Documents/PIN_cal/R_git"
+
 
 # 입력 데이터 경로 (나라별 하위 디렉토리 포함)
 DATA_RAW_DIR <- file.path(PROJECT_ROOT, "data", "raw")

@@ -5,12 +5,12 @@
 # 실행 흐름:
 #   1. 모듈 로드 (00_setup ~ 04_vpin_worker)
 #   2. 나라별 순회:
-#      a) stream_daily_bs()         → 파일별 스트리밍 B/S 집계 (OOM 방지)
-#      b) run_pin_all()             → PIN 추정 (체크포인트 + 병렬)
-#      c) run_adjpin_all()          → AdjPIN 추정 (체크포인트 + 병렬)
-#      d) rm(daily_bs); gc()        → PIN/AdjPIN 메모리 해제
-#      e) stream_vpin_ticks_to_disk() → 종목별 임시 parquet 생성
-#      f) run_vpin_all_streaming()  → VPIN 순차 계산 (종목별 파일 로드)
+#      a) stream_daily_bs()       → Arrow lazy 일별 B/S 집계 (OOM 방지)
+#      b) run_pin_all()           → PIN 추정 (체크포인트 + 병렬)
+#      c) run_adjpin_all()        → AdjPIN 추정 (체크포인트 + 병렬)
+#      d) rm(daily_bs); gc()      → PIN/AdjPIN 메모리 해제
+#      e) get_vpin_symbols()      → Arrow lazy 종목 목록 조회
+#      f) run_vpin_all_arrow()    → VPIN 병렬 계산 (predicate pushdown)
 #   3. 완료 로그
 #
 # 실행:
@@ -82,15 +82,15 @@ for (country in COUNTRIES) {
   log_msg(sprintf("=== %s 파이프라인 시작 ===", country), log_file)
 
 
-  # ── 2-a) PIN/AdjPIN용 스트리밍 집계 ────────────────────────────────────
-  # 파일 1개씩 읽고 → Date,Symbol,LR 3컬럼만 → 즉시 일별 B/S 집계 → raw 해제
-  # 메모리: 파일 1개 × 3컬럼 + 누적 집계 결과 (작음)
-  log_msg(sprintf("[%s] PIN/AdjPIN 데이터 스트리밍 집계 중...", country), log_file)
+  # ── 2-a) PIN/AdjPIN용 Arrow lazy 집계 ──────────────────────────────────
+  # arrow::open_dataset() → lazy 쿼리 → collect()
+  # Arrow C++ 엔진이 파일별 스트리밍 처리, R에는 집계 결과만 로드
+  log_msg(sprintf("[%s] PIN/AdjPIN 데이터 Arrow lazy 집계 중...", country), log_file)
 
   daily_bs <- tryCatch(
     stream_daily_bs(country, log_file),
     error = function(e) {
-      log_msg(sprintf("[ERROR] %s 스트리밍 집계 실패: %s", country, e$message), log_file)
+      log_msg(sprintf("[ERROR] %s Arrow lazy 집계 실패: %s", country, e$message), log_file)
       NULL
     }
   )
@@ -113,24 +113,21 @@ for (country in COUNTRIES) {
   rm(daily_bs); gc()
 
 
-  # ── 2-d) VPIN 스트리밍 ─────────────────────────────────────────────────
-  # 파일 1개씩 읽고 → 종목별로 분할 → 종목별 임시 parquet 저장
-  # 이후 종목별 파일을 하나씩 읽어 VPIN 계산
-  log_msg(sprintf("[%s] VPIN 틱 스트리밍 시작...", country), log_file)
-
-  vpin_tmp_dir <- file.path(OUTPUT_DIR, country, "vpin", "_tmp_ticks")
+  # ── 2-d) VPIN — Arrow predicate pushdown ────────────────────────────────
+  # 종목 목록만 lazy 조회 → 각 워커가 filter(Symbol==sym)으로 자기 데이터만 로드
+  log_msg(sprintf("[%s] VPIN 시작 (Arrow predicate pushdown)...", country), log_file)
 
   vpin_symbols <- tryCatch(
-    stream_vpin_ticks_to_disk(country, vpin_tmp_dir, log_file),
+    get_vpin_symbols(country, log_file),
     error = function(e) {
-      log_msg(sprintf("[ERROR] %s VPIN 스트리밍 실패: %s", country, e$message), log_file)
+      log_msg(sprintf("[ERROR] %s VPIN 종목 조회 실패: %s", country, e$message), log_file)
       character(0)
     }
   )
 
   if (length(vpin_symbols) > 0) {
     log_msg(sprintf("[%s] VPIN 계산 시작 (%d종목)...", country, length(vpin_symbols)), log_file)
-    run_vpin_all_streaming(vpin_symbols, vpin_tmp_dir, country, log_file)
+    run_vpin_all_arrow(vpin_symbols, country, log_file)
   }
 
   gc()
