@@ -24,9 +24,17 @@
 #   @vpin         : numeric vector
 #   @dailyvpin    : data.frame (day, dvpin, dwvpin)
 #
+# ─── ★ dp=0 문제 해결 ──────────────────────────────────────────────────────
+#   기존: Python이 Price(=last만) 저장 → vpin()이 dp=last-first=0
+#   수정: Python이 Open+Close 저장 → R에서 2개 pseudo-tick으로 확장
+#         tick1: (timestamp,   Open,  0)       ← first price = Open
+#         tick2: (timestamp+1, Close, Volume)  ← last price  = Close
+#         → dp = Close - Open (올바른 가격변동)
+#
 # ─── 입출력 ──────────────────────────────────────────────────────────────────
 #   입력: R_output/{COUNTRY}/vpin/all_1m_bars.parquet  (01_preprocess.py 출력)
-#         스키마: Symbol(Utf8), Datetime(Datetime), Price(Float64), Volume(Float64)
+#         스키마: Symbol(Utf8), Datetime(Datetime),
+#                Open(Float64), Close(Float64), Volume(Float64)
 #
 #   출력: R_output/{COUNTRY}/vpin/
 #         vpin_{COUNTRY}_{YYYYMMDD_HHMM}.parquet        ← 전체 버킷별 결과
@@ -36,8 +44,8 @@
 # ─── 병렬 처리 전략 ─────────────────────────────────────────────────────────
 #   1) 메인: bars_dt를 종목별 리스트로 분할 (data.table split — 빠름)
 #   2) 메인: PSOCK 클러스터 생성, 배치 단위로 parLapply 호출
-#   3) 워커: 종목 data.frame 수신 → vpin() 계산 → RDS 직접 저장
-#            → 상태 문자열만 메인으로 반환 (IPC 최소화)
+#   3) 워커: 종목 data.frame 수신 → pseudo-tick 확장 → vpin() 계산
+#            → RDS 직접 저장 → 상태 문자열만 메인으로 반환 (IPC 최소화)
 #   4) 메인: 배치마다 진행 상황 출력 + 클러스터 건강 확인
 #   5) 레이스 컨디션 없음: 워커별 고유 파일(sym_{종목}.rds) 쓰기
 #
@@ -125,6 +133,20 @@ cat(sprintf("\n[1] 데이터 로드 중...\n"))
 
 bars_dt <- as.data.table(arrow::read_parquet(INPUT_PATH))
 
+# ── 스키마 검증: Open/Close 열 존재 여부 확인 ──
+if (!all(c("Open", "Close") %in% names(bars_dt))) {
+  # 구버전 parquet (Price만 있는 경우) → 에러 메시지
+  if ("Price" %in% names(bars_dt)) {
+    stop(paste0(
+      "[Error] 입력 파일에 'Open', 'Close' 열이 없고 'Price'만 있습니다.\n",
+      "  dp=0 문제를 해결하려면 vpin_pre.py를 수정 버전으로 재실행하세요.\n",
+      "  (FORCE_REPROCESS = True 설정 후 python vpin_pre.py)"
+    ))
+  } else {
+    stop("[Error] 입력 파일에 'Open', 'Close' 열이 없습니다.")
+  }
+}
+
 # Datetime → POSIXct 변환 (안전하게)
 if (!inherits(bars_dt$Datetime, "POSIXct")) {
   bars_dt[, Datetime := as.POSIXct(Datetime, tz = "Asia/Seoul")]
@@ -137,6 +159,14 @@ cat(sprintf("  전체 종목 수  : %d\n", uniqueN(bars_dt$Symbol)))
 cat(sprintf("  시간 범위     : %s ~ %s\n",
             format(min(bars_dt$Datetime)), format(max(bars_dt$Datetime))))
 
+# ── dp 검증 출력 ──
+n_nonzero <- sum(bars_dt$Open != bars_dt$Close, na.rm = TRUE)
+pct_nonzero <- n_nonzero / nrow(bars_dt) * 100
+cat(sprintf("  dp≠0 봉 비율  : %s / %s (%.1f%%)\n",
+            format(n_nonzero, big.mark = ","),
+            format(nrow(bars_dt), big.mark = ","),
+            pct_nonzero))
+
 
 # =============================================================================
 # [2] 데이터 정제
@@ -147,8 +177,8 @@ cat(sprintf("\n[2] 데이터 정제\n"))
 n_before <- nrow(bars_dt)
 
 # NA, 0 이하 제거
-bars_dt <- bars_dt[!is.na(Datetime) & !is.na(Price) & !is.na(Volume)]
-bars_dt <- bars_dt[Price > 0 & Volume > 0]
+bars_dt <- bars_dt[!is.na(Datetime) & !is.na(Open) & !is.na(Close) & !is.na(Volume)]
+bars_dt <- bars_dt[Open > 0 & Close > 0 & Volume > 0]
 
 n_removed <- n_before - nrow(bars_dt)
 if (n_removed > 0)
@@ -190,9 +220,20 @@ cat(sprintf("  완료: %d종목  |  잔여: %d종목\n",
 # [4] 종목별 데이터 분할 → PSOCK 병렬 처리
 # =============================================================================
 #
+# ★ 핵심 수정: 워커 내부에서 1분봉 (Open, Close, Volume) →
+#   2개 pseudo-tick으로 확장한 뒤 vpin()에 전달
+#
+#   tick1: (Datetime,     Open,  0)       ← first price = Open
+#   tick2: (Datetime + 1, Close, Volume)  ← last price  = Close
+#
+#   이렇게 하면 vpin()이 60초 타임바로 재집계할 때:
+#     dp  = last(price) - first(price) = Close - Open  ← 올바른 가격변동
+#     tbv = 0 + Volume = Volume                        ← 올바른 거래량
+#
 # 워커 설계:
 #   - 워커는 (symbol, sym_df, params, checkpoint_dir) 를 받는다
 #   - 워커 내부에서 POSIXct tzone을 명시적으로 재설정 (PSOCK 직렬화 유실 방지)
+#   - ★ Open/Close → pseudo-tick 확장 후 vpin() 호출
 #   - vpin() 계산 후 RDS를 직접 저장 → 상태 리스트만 반환 (IPC 최소화)
 #   - 각 워커가 고유 파일(sym_{종목}.rds)에 쓰므로 레이스 컨디션 없음
 #
@@ -235,19 +276,49 @@ worker_fn <- function(args) {
     ts_raw <- as.POSIXct(as.character(ts_raw), tz = "Asia/Seoul")
   }
 
-  # vpin() 입력: 열 순서 {timestamp, price, volume}
+  # ══════════════════════════════════════════════════════════════════════════
+  # ★ 핵심: 1분봉 (Open, Close, Volume) → 2개 pseudo-tick으로 확장
+  # ══════════════════════════════════════════════════════════════════════════
+  #
+  #   tick1: (timestamp = Datetime,     price = Open,  volume = 0)
+  #   tick2: (timestamp = Datetime + 1, price = Close, volume = Volume)
+  #
+  #   → vpin()이 timebarsize=60 로 집계하면:
+  #     dp  = last(Close) - first(Open) = Close - Open  ← 올바른 dp
+  #     tbv = 0 + Volume                                ← 올바른 volume
+  # ══════════════════════════════════════════════════════════════════════════
+
+  n_bars <- length(ts_raw)
+
+  open_prices  <- as.numeric(sym_df$Open)
+  close_prices <- as.numeric(sym_df$Close)
+  volumes      <- as.numeric(sym_df$Volume)
+
+  # tick1: bar 시작 시점, Open 가격, volume = 0
+  ts_tick1  <- ts_raw
+  p_tick1   <- open_prices
+  v_tick1   <- rep(0, n_bars)
+
+  # tick2: bar 시작 + 1초, Close 가격, volume = 전체 거래량
+  ts_tick2  <- ts_raw + 1  # 1초 뒤
+  p_tick2   <- close_prices
+  v_tick2   <- volumes
+
+  # 두 틱을 인터리브하여 시간순 정렬
   vpin_input <- data.frame(
-    timestamp = ts_raw,
-    price     = as.numeric(sym_df$Price),
-    volume    = as.numeric(sym_df$Volume)
+    timestamp = c(ts_tick1, ts_tick2),
+    price     = c(p_tick1, p_tick2),
+    volume    = c(v_tick1, v_tick2),
+    stringsAsFactors = FALSE
   )
+  vpin_input <- vpin_input[order(vpin_input$timestamp), ]
 
   # NA 제거
   ok <- complete.cases(vpin_input)
-  if (sum(ok) < 100L) {
+  if (sum(ok) < 200L) {  # 최소 100봉 * 2틱 = 200행
     saveRDS(empty_df, ckpt_path)
     return(list(symbol = symbol, n_rows = 0L,
-                error = paste0("유효 행 부족: ", sum(ok))))
+                error = paste0("유효 행 부족: ", sum(ok), "/", length(ok))))
   }
   vpin_input <- vpin_input[ok, ]
 
@@ -356,10 +427,10 @@ if (length(remaining_syms) == 0) {
 
   cat(sprintf("\n[4] 종목 데이터 분할 (%d종목)...\n", length(remaining_syms)))
 
-  # 필요한 종목만 추출 후 분할
+  # ★ 수정: Open, Close, Volume 모두 전달 (기존: Datetime, Price, Volume)
   bars_remaining <- bars_dt[Symbol %in% remaining_syms]
   split_list     <- split(
-    bars_remaining[, .(Datetime, Price, Volume)],
+    bars_remaining[, .(Datetime, Open, Close, Volume)],
     bars_remaining$Symbol
   )
   rm(bars_remaining); gc()

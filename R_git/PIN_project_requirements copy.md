@@ -8,6 +8,7 @@ R 패키지 `PINstimation` (https://github.com/monty-se/PINstimation) 을 사용
 여러 나라의 주식 종목별로 **PIN**, **Adjusted PIN (AdjPIN)**, **VPIN** 을 계산하는
 병렬 배치 파이프라인을 구축한다.
 
+틱 데이터에 이미 LR(Lee-Ready) 알고리즘으로 분류된 매수/매도 컬럼이 존재하므로, trade classification 단계를 건너뛰고 바로 집계 후 추정한다.
 ---
 
 ## 2. 원본 데이터 스펙
@@ -23,22 +24,32 @@ R 패키지 `PINstimation` (https://github.com/monty-se/PINstimation) 을 사용
 | Time     | time64    | 거래 시각                                |
 | LR       | int8      | LR 알고리즘 분류 결과 (1=매수, -1=매도, 0=미분류) |
 
-### 2-2. 저장 구조
+### 2-2. 입출력 구조
 
-- 나라별로 별도 디렉토리에 저장되어 있음
-- 입력 경로 예시: `data/raw/{country}/`
+<입력>
+  루트: E:\vpin_project_parquet\input_data
+  하위: 국가코드로 시작하는 폴더들이 다수 존재
+  
+  예시:
+    E:\vpin_project_parquet\input_data\
+    ├── KOR_2019\
+    │   ├── kor_2019_01.parquet
+    │   ├── kor_2019_02.parquet
+    │   └── ...
+    ├── KOR_2020\
+    │   ├── kor_2020_01.parquet
+    │   └── ...
+    └── USA_2021\
+        └── ...
 
----
+  - 폴더명: {국가코드}_{연도} 또는 유사 형태 (국가코드로 시작)
+  - 파일명: {국가코드}_{연도}_{청크번호}.parquet
+    (한 연도의 데이터를 n개로 분할한 파일)
+  - 하나의 국가를 처리할 때, 해당 국가코드로 시작하는 모든 폴더 내의
+    .parquet 파일을 전부 읽어야 한다.
 
-## 3. 파일 및 디렉토리 구조
-
-```
-project_root/
-├── data/
-│   └── raw/
-│       ├── KR/          ← 나라별 원본 데이터
-│       ├── US/
-│       └── JP/
+<출력>
+루트: E:\vpin_project_parquet\output
 ├── output/
 │   ├── KR/              ← 나라별 결과 출력
 │   │   ├── pin/         ← 종목별 PIN 결과 파일
@@ -46,6 +57,13 @@ project_root/
 │   │   └── vpin/        ← 종목별 VPIN 결과 파일
 │   ├── US/
 │   └── JP/
+
+
+## 3. 파일 및 디렉토리 구조
+
+```
+project_root/
+
 ├── R/
 │   ├── 00_setup.R
 │   ├── 01_data_prep.R
