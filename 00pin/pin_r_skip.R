@@ -106,7 +106,7 @@ BASE_DIR <- "E:/vpin_project_parquet/processing_data"
 # suji : "E:/vpin_project_parquet/processing_data"
 
 # 처리할 나라코드 (01_preprocess.py 의 COUNTRY 와 일치해야 함)
-COUNTRY <- "KOR"
+COUNTRY <- "UK"
 
 # ── 롤링 윈도우 파라미터 ──────────────────────────────────────────────────────
 WINDOW_SIZE    <- 60   # 롤링 윈도우 크기 (영업일)

@@ -49,7 +49,7 @@ warnings.filterwarnings("ignore")
 # =============================================================================
 
 BASE_DIR = r"E:\vpin_project_parquet/processing_data"
-COUNTRY = "KOR"
+COUNTRY = "UK"
 FORCE_REPROCESS = False
 
 # =============================================================================

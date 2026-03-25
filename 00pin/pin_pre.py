@@ -54,7 +54,7 @@ BASE_DIR = r"E:\vpin_project_parquet\processing_data"
 
 # 처리할 나라코드 — 이 코드로 시작하는 모든 연도 폴더를 자동 스캔
 # 예) "KOR" → KOR_2019, KOR_2020, KOR_2021 ... 자동 탐색
-COUNTRY = "KOR"
+COUNTRY = "UK"
 
 # True → 기존 캐시 파일이 있어도 강제 재생성
 FORCE_REPROCESS = False

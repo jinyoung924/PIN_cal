@@ -72,7 +72,7 @@ suppressPackageStartupMessages({
 # =============================================================================
 
 BASE_DIR <- "E:/vpin_project_parquet/processing_data"
-COUNTRY  <- "KOR"
+COUNTRY  <- "UK"
 
 # ── vpin() 파라미터 ──────────────────────────────────────────────────────────
 TIMEBARSIZE_SEC <- 60L    # 타임바 크기(초). 1분봉 = 60
